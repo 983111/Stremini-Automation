@@ -3,12 +3,18 @@ const {
   ipcMain, screen, nativeImage, clipboard, desktopCapturer
 } = require('electron');
 const path = require('path');
+const fs   = require('fs');
+const os   = require('os');
 
-let win  = null;
-let tray = null;
+let win     = null;
+let tray    = null;
 let visible = true;
 
 const W = 590, H = 600;
+
+// ── Gemini API Key ───────────────────────────────────────────────────────────
+// Set GEMINI_API_KEY as an environment variable, or paste it directly here:
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyA9I9GBWo3nDUs0DZ_aEMkig2TgUQCslCI';
 
 // ── Create overlay window ────────────────────────────────────────────────────
 function createWindow() {
@@ -23,6 +29,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: false,
       preload: path.join(__dirname, 'preload.js'),
     },
   });
@@ -57,22 +64,40 @@ ipcMain.on('resize', (_, { height }) => {
 ipcMain.on('hide', () => toggle(false));
 
 // ── IPC: clipboard ───────────────────────────────────────────────────────────
-ipcMain.handle('read-clipboard',  ()    => clipboard.readText() || '');
+ipcMain.handle('read-clipboard',  ()     => clipboard.readText() || '');
 ipcMain.handle('write-clipboard', (_, t) => { clipboard.writeText(t); return true; });
 
-// ── IPC: screen capture → real screenshot + text extraction ─────────────────
+// ── Desktop screenshot helper ────────────────────────────────────────────────
+async function refreshDesktopScreenshot() {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 1920, height: 1080 },
+    });
+    if (sources.length > 0) {
+      const tmpPath = path.join(os.tmpdir(), 'stremini_screen.png');
+      fs.writeFileSync(tmpPath, sources[0].thumbnail.toPNG());
+      return { path: tmpPath, name: sources[0].name };
+    }
+  } catch (_) {}
+  return null;
+}
+
+// ── IPC: screen capture ──────────────────────────────────────────────────────
 ipcMain.handle('capture-screen', async () => {
   try {
-    // Step 1: hide overlay briefly so it's not captured
     if (win) win.hide();
     await sleep(300);
 
+    const shot = await refreshDesktopScreenshot();
+
     let capturedText = '';
     let title = 'Desktop';
-    let url = '';
+    let url   = '';
 
-    // Step 2: Try reading text from other visible Electron windows first
-    const others = BrowserWindow.getAllWindows().filter(w => w !== win && !w.isDestroyed() && w.isVisible());
+    const others = BrowserWindow.getAllWindows().filter(
+      w => w !== win && !w.isDestroyed() && w.isVisible()
+    );
     for (const w of others) {
       try {
         const text = await w.webContents.executeJavaScript(
@@ -87,48 +112,22 @@ ipcMain.handle('capture-screen', async () => {
       } catch (_) {}
     }
 
-    // Step 3: Use desktopCapturer to get a real screenshot, then extract text via JS
-    if (!capturedText) {
-      try {
-        const sources = await desktopCapturer.getSources({
-          types: ['screen'],
-          thumbnailSize: { width: 1920, height: 1080 }
-        });
-
-        // Save the screenshot to a temp file so the AI can reference it
-        if (sources.length > 0) {
-          const img = sources[0].thumbnail;
-          const tmpPath = path.join(require('os').tmpdir(), 'stremini_screen.png');
-          require('fs').writeFileSync(tmpPath, img.toPNG());
-
-          // Send the screenshot path to the renderer so it can be described by the AI
-          if (win) {
-            win.showInactive();
-            win.webContents.send('screen-captured', { imagePath: tmpPath, title: sources[0].name });
-          }
-
-          // Also extract window names + clipboard as text fallback context
-          const windowNames = sources
-            .filter(s => s.name && s.name !== 'Stremini')
-            .slice(0, 8)
-            .map(s => `• ${s.name}`)
-            .join('\n');
-          const clip = clipboard.readText();
-          capturedText = [
-            windowNames ? `Visible windows:\n${windowNames}` : '',
-            clip ? `Clipboard:\n${clip.slice(0, 2000)}` : '',
-          ].filter(Boolean).join('\n\n') || 'Screen captured as image.';
-
-          title = sources[0].name || 'Desktop';
-          return { text: capturedText, title, url, imagePath: tmpPath, hasImage: true };
-        }
-      } catch (e) {
-        capturedText = `Screen capture error: ${e.message}`;
-      }
+    if (!capturedText && shot) {
+      const clip = clipboard.readText();
+      capturedText = clip ? `Clipboard:\n${clip.slice(0, 2000)}` : 'Screenshot captured.';
+      title = shot.name || 'Desktop';
     }
 
     if (win) win.showInactive();
-    return { text: capturedText || 'No readable screen content found.', title, url, hasImage: false };
+    if (shot) win && win.webContents.send('screen-captured', { imagePath: shot.path, title });
+
+    return {
+      text:      capturedText || 'No readable content.',
+      title,
+      url,
+      imagePath: shot?.path || null,
+      hasImage:  !!shot,
+    };
   } catch (e) {
     if (win) win.showInactive();
     return { text: `Screen read error: ${e.message}`, title: '', url: '', hasImage: false };
@@ -136,12 +135,13 @@ ipcMain.handle('capture-screen', async () => {
 });
 
 // ── IPC: automation ──────────────────────────────────────────────────────────
-let _autoCtx = null;
-
 ipcMain.handle('run-automation', async (_, { task }) => {
-  const { runTask } = require(path.join(__dirname, 'automation', 'engine'));
+  const engine = require(path.join(__dirname, 'automation', 'engine'));
+  engine.setGeminiKey(GEMINI_API_KEY);
+  await refreshDesktopScreenshot();
+
   return new Promise(resolve => {
-    runTask(
+    engine.runTask(
       task,
       step  => win && win.webContents.send('auto-step',  step),
       done  => { win && win.webContents.send('auto-done',  done);  resolve({ success: true,  done  }); },
@@ -150,7 +150,6 @@ ipcMain.handle('run-automation', async (_, { task }) => {
   });
 });
 
-// ADD this new handler for the stop button:
 ipcMain.handle('stop-automation', () => {
   const { stopTask } = require(path.join(__dirname, 'automation', 'engine'));
   stopTask();
@@ -173,7 +172,7 @@ app.whenReady().then(() => {
   tray = new Tray(nativeImage.createEmpty());
   tray.setToolTip('Stremini — Ctrl+Space to toggle');
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Stremini',              enabled: false },
+    { label: 'Stremini',               enabled: false },
     { type:  'separator' },
     { label: 'Show/Hide (Ctrl+Space)', click: () => toggle() },
     { type:  'separator' },
