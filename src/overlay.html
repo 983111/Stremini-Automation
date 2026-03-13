@@ -529,7 +529,27 @@ async function runAuto(task) {
   autoRunning = true; closePanel(); openTerm(task);
   tlog('planning', `Goal: "${task}"`);
 
-  if (!window.stremini) { tlog('error','Requires the Electron desktop app'); $('t-status').textContent='Error'; autoRunning=false; return; }
+  if (!window.stremini) {
+  tlog('planning', '⚠ Browser mode — generating plan only (no execution)');
+  try {
+    const res = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'chat', query: `You are a browser automation planner. List the exact steps to: "${task}". Format as a numbered list with each step's tool and parameters clearly stated.` }),
+    });
+    const d = await res.json();
+    const lines = (d.content || '').split('\n').filter(Boolean);
+    lines.forEach(l => tlog('executing', l));
+    tlog('done', '✅ Plan ready — launch Stremini Desktop app to execute this.');
+    $('t-bar').style.width = '100%';
+    $('t-status').textContent = 'Plan ready';
+  } catch (e) {
+    tlog('error', 'Could not generate plan: ' + e.message);
+  }
+  autoRunning = false;
+  sync();
+  return;
+}
 
   // NOTE: IPC listeners (onAutoStep/onAutoDone/onAutoError) are registered ONCE
   // at startup — do NOT register them here to avoid stacking duplicate handlers.
