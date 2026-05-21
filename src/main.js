@@ -14,7 +14,7 @@ const W = 590, H = 600;
 
 // ── Gemini API Key ───────────────────────────────────────────────────────────
 // Set GEMINI_API_KEY as an environment variable, or paste it directly here:
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyA9I9GBWo3nDUs0DZ_aEMkig2TgUQCslCI';
+const GEMINI_API_KEY = ';
 
 // ── Create overlay window ────────────────────────────────────────────────────
 function createWindow() {
